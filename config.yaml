@@ -1,0 +1,343 @@
+version: "2.05"
+sql:
+  fetch_entities: |
+    select -- PFI.pm script from Appworx batch job PREF_FIN_INSTITUTION_SET
+           -- written and supported by CoreDev
+      p.persnbr as entnbr,'P' as enttype, PACKAGE_PFI.PERS_PFIYN(persnbr) as pfiyn from pers p
+    where p.purgeyn != 'Y'
+      and exists (
+        select 1
+        from acct a
+        where a.taxrptforpersnbr = p.persnbr
+          and a.curracctstatcd <> 'CLS'
+          and a.curracctstatcd <> 'CO'
+        union
+        select 1
+        from acctacctrolepers ap
+        join acct a1
+          on ap.acctnbr = a1.acctnbr
+        where ap.acctrolecd = 'OWN'
+          and ap.persnbr = p.persnbr
+          and a1.curracctstatcd <> 'CLS'
+          and a1.curracctstatcd <> 'CO'
+        union
+        select 1
+        from persuserfield
+        where userfieldcd = 'PFI'
+          and value = 'Y'
+          and persnbr = p.persnbr
+      )
+    union all
+    select orgnbr as entnbr,'O' as enttype, PACKAGE_PFI.ORG_PFIYN(orgnbr) as pfiyn
+    from org o
+    where exists (
+      select 1
+      from acct zz
+      where zz.taxrptfororgnbr = o.orgnbr
+        and zz.curracctstatcd <> 'CLS'
+        and zz.curracctstatcd <> 'CO'
+      union
+      select 1
+      from orguserfield
+      where userfieldcd = 'PFI'
+        and value = 'Y'
+        and orgnbr = o.orgnbr
+    )
+  pers_uf_merge: |
+    merge into PERSUSERFIELD puf
+    using (
+      select persnbr from pers
+      where persnbr = :id
+    ) m
+      on (puf.persnbr = m.persnbr and puf.userfieldcd = 'PFI')
+    when matched then update
+      set puf.value = 'Y', puf.datelastmaint = sysdate
+    when not matched then insert
+      (PERSNBR, USERFIELDCD, VALUE, DATELASTMAINT)
+    values
+      (:id, 'PFI', 'Y', sysdate)
+  pers_warn_delete: |
+    delete from PERSWRN where persnbr = :id and wrnflagcd = 'PFI'
+  pers_uf_delete: |
+    delete from PERSUSERFIELD where persnbr = :id and userfieldcd = 'PFI'
+  pers_warn_merge: |
+    merge into PERSWRN pw
+    using (
+      select persnbr from pers
+      where persnbr = :id
+    ) m
+      on (pw.persnbr = m.persnbr and pw.wrnflagcd = 'PFI')
+    when matched then update
+      set pw.inactivedate = null, pw.datelastmaint = sysdate
+    when not matched then insert
+    values
+      (:id, trunc(sysdate), 'PFI', null, null, sysdate)
+  org_uf_merge: |
+    merge into ORGUSERFIELD ouf
+    using (
+      select orgnbr from org
+      where orgnbr = :id
+    ) m
+      on (ouf.orgnbr = m.orgnbr and ouf.userfieldcd = 'PFI')
+    when matched then update
+      set ouf.value = 'Y', ouf.datelastmaint = sysdate
+    when not matched then insert
+      (ORGNBR, USERFIELDCD, VALUE, DATELASTMAINT)
+    values
+      (:id, 'PFI', 'Y', sysdate)
+  org_uf_delete: |
+    delete from ORGUSERFIELD where orgnbr = :id and userfieldcd = 'PFI'
+package_pfi_sql: |
+  CREATE OR REPLACE PACKAGE PACKAGE_PFI AS
+  -- This package has Two functions in it PERS_PFIYN, and ORG_PFIYN
+  -- Both function will return Y or N (Preferred FI = Y)
+  -- Input param should be the orgnbr or the persnbr
+  -- ***********************************************************
+  -- Version 1.0
+  -- Written by CoreDev Team 09/2019 (Chris Berning)
+  -- Source can be found on git at https://git.ftfcu.corp/FTFCU/production-scripts-PFI-Flag
+  -- ************************************************************
+  FUNCTION PERS_PFIYN(IN_PERSNBR IN NUMBER)
+    RETURN varchar2;
+  FUNCTION ORG_PFIYN(IN_ORGNBR IN NUMBER)
+    RETURN varchar2;
+  END PACKAGE_PFI;
+  /
+  CREATE OR REPLACE PACKAGE BODY PACKAGE_PFI AS
+    FUNCTION PERS_PFIYN(IN_PERSNBR IN NUMBER)
+      RETURN varchar2 AS
+      PFI varchar2(1);
+    BEGIN
+      PFI := 'N';
+      WITH accts AS (
+        SELECT
+          aa.acctnbr,
+          aa.taxrptforpersnbr AS persnbr
+        FROM acct aa
+        WHERE aa.mjaccttypcd IN ('CK', 'SAV')
+          AND aa.curracctstatcd NOT IN ('CLS','CO')
+          AND aa.taxrptforpersnbr = IN_PERSNBR
+        UNION ALL
+        SELECT
+          ab.acctnbr,
+          ap.persnbr AS persnbr
+        FROM acct ab
+        JOIN acctacctrolepers ap ON ab.acctnbr = ap.acctnbr
+        WHERE ab.mjaccttypcd IN ('CK', 'SAV')
+          AND ab.curracctstatcd NOT IN ('CLS','CO')
+          AND ap.acctrolecd = 'OWN'
+          AND (ap.inactivedate IS NULL OR ap.inactivedate > SYSDATE)
+          AND persnbr = IN_PERSNBR
+      ),
+      outcount AS (
+        SELECT a.persnbr, a.acctnbr, count(r.tranamt) AS trancnt
+        FROM accts a
+        LEFT JOIN RTXN r
+          ON a.acctnbr = r.acctnbr
+          AND r.origpostdate >= trunc(add_months(sysdate,-1),'MM')
+          AND r.currrtxnstatcd = 'C'
+          AND r.tranamt < 0
+          AND r.rtxntypcd IN ('ICHK','ECHK','CKUS','CWTH','DWTH','ONUS','XWTH','PWTH','IWTH')
+        GROUP BY a.persnbr, a.acctnbr
+      ),
+      descript AS (
+        SELECT extrtxndescnbr
+        FROM extrtxndesc d
+        WHERE (d.extrtxndesctext LIKE '%DIR%' AND d.extrtxndesctext LIKE '%DEP%')
+          OR (d.extrtxndesctext LIKE '%EDIP%')
+          OR (
+            (
+              (
+                (REGEXP_LIKE(d.extrtxndesctext , '(^|\s)PERS($|\s)')
+                AND NOT REGEXP_LIKE(d.extrtxndesctext, '^ABC'))
+              )
+              OR (
+                REGEXP_LIKE(d.extrtxndesctext, 'EDI\s*P')
+                AND NOT REGEXP_LIKE(d.extrtxndesctext, 'WEALTHFRONT')
+              )
+              OR REGEXP_LIKE(d.extrtxndesctext, 'SOC.*SEC', 'i')
+              OR REGEXP_LIKE(d.extrtxndesctext, 'PAYRO?LL', 'i')
+              OR REGEXP_LIKE(d.extrtxndesctext, 'SALARY', 'i')
+              OR (
+                REGEXP_LIKE(d.extrtxndesctext, 'TREAS 310', 'i')
+                AND NOT REGEXP_LIKE(d.extrtxndesctext, '^IRS', 'i')
+                AND NOT REGEXP_LIKE(d.extrtxndesctext, 'TAX', 'i')
+              )
+              OR (
+                REGEXP_LIKE(d.extrtxndesctext, 'DIRECT PAY($|\s)', 'i')
+                AND NOT REGEXP_LIKE(d.extrtxndesctext, 'HSA', 'i')
+              )
+              OR REGEXP_LIKE(d.extrtxndesctext, 'EMPLOY.*BENEFIT', 'i')
+              OR REGEXP_LIKE(d.extrtxndesctext, '(^|\s)ANN((UI)|(TY))', 'i')
+              OR REGEXP_LIKE(d.extrtxndesctext, '(^|\s)RET.*BEN', 'i')
+              OR REGEXP_LIKE(d.extrtxndesctext, 'PROVIDENCE', 'i')
+              OR REGEXP_LIKE(d.extrtxndesctext, 'PUB.*EMP', 'i')
+              OR REGEXP_LIKE(d.extrtxndesctext, 'DFAS', 'i')
+              OR REGEXP_LIKE(d.extrtxndesctext, '(PAY|DDP).*BIWEEKLY', 'i')
+              OR REGEXP_LIKE(d.extrtxndesctext, 'SUREPAY($|\s)', 'i')
+              OR REGEXP_LIKE(d.extrtxndesctext, 'MONTHLYPAY($|\s)', 'i')
+            )
+            AND (
+              NOT REGEXP_LIKE(d.extrtxndesctext, 'PROSPER MARKET', 'i')
+              AND NOT REGEXP_LIKE(d.extrtxndesctext, '(HC|\s|^)CLAIM', 'i')
+            )
+          )
+          OR (
+            REGEXP_LIKE(d.extrtxndesctext, 'TAXRFD', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'PR PAYMENT', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'CLIENT DD', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'DDFUND', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'FIDELITY EMP SVC', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'MICROSOFT GLOBAL.*PAY', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'SALEM AREA.*PPD', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'TW.*PROCESSIN', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'MIZE HOUSER.*PAY', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'STANDARD INSURAN', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, '.*QUICKBOOKS.*', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, '^EC COMPANY.*(99|\s)GR', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, '(\s|^)GUSTO .*PAY', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, '(^|\s)PN PMTS', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, '(^|\s)PENS($|\s)', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, '(^|\s|\*)NET(=| )PAY', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'FUNDING CIRCLE', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'CUSTOMER', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'DIRECT.*DEPOSIT', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'RETIREDPAY', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'IBMNETPAYS', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'IBMDLYPAYS', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'MICRON TECHNOLOG', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'MPHASIS.*PAYMENT', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'UPR AGUA NOMINA', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'AN AGENT DRIVEN', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, '^GRUBHUB INC.*ACTVTY', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, '^POSTMATES INC', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, '^DOORDASH, INC', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'MICROBE.*DEPOSIT', 'i')
+            OR REGEXP_LIKE(d.extrtxndesctext, 'SALEM KEIZER.* ACH ITEMS', 'i')
+          )
+      ),
+      ddpayroll AS (
+        SELECT o.persnbr, SUM(o.trancnt), SUM(qualified_deposits.tranamt)
+        FROM outcount o
+        LEFT JOIN (
+          SELECT r.acctnbr, r.tranamt
+          FROM rtxn r
+          JOIN descript d ON r.extrtxndescnbr = d.extrtxndescnbr
+          WHERE r.origpostdate >= trunc(add_months(sysdate,-1),'MM')
+            AND r.currrtxnstatcd = 'C'
+            AND r.tranamt > 0
+            AND (r.rtxntypcd = 'XDEP' OR r.rtxntypcd = 'IDEP')
+        ) qualified_deposits ON o.acctnbr = qualified_deposits.acctnbr
+        GROUP BY o.persnbr
+        HAVING SUM(o.trancnt) >= 5 AND SUM(qualified_deposits.tranamt) >= 750
+      )
+      SELECT (CASE WHEN dp.persnbr IS NOT NULL THEN 'Y' ELSE 'N' END) INTO PFI
+      FROM pers p
+      LEFT JOIN ddpayroll dp ON dp.persnbr = p.persnbr
+      WHERE p.purgeyn != 'Y'
+        AND p.persnbr = IN_PERSNBR
+        AND ROWNUM = 1;
+      IF PFI IS NULL THEN
+        PFI := 'N';
+      END IF;
+      RETURN PFI;
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+        PFI := 'N';
+        RETURN PFI;
+      WHEN OTHERS THEN
+        PFI := 'N';
+        RETURN PFI;
+    END PERS_PFIYN;
+    FUNCTION ORG_PFIYN(IN_ORGNBR IN NUMBER)
+      RETURN VARCHAR2 IS
+      PFI varchar2(1);
+    BEGIN
+      WITH accts AS (
+        SELECT
+          aa.acctnbr, aa.taxrptfororgnbr AS orgnbr,
+          (CASE
+            WHEN aa.contractdate > last_day(trunc(add_months(sysdate, -4))) THEN 'Y'
+            ELSE 'N'
+          END) AS newacctyn
+        FROM acct aa
+        WHERE aa.mjaccttypcd = 'CK'
+          AND aa.curracctstatcd NOT IN ('CLS','CO')
+          AND aa.taxrptfororgnbr = IN_ORGNBR
+      ),
+      trans AS (
+        SELECT
+          ac.acctnbr, ac.orgnbr, ac.newacctyn,
+          SUM(CASE
+            WHEN r.origpostdate > last_day(trunc(add_months(sysdate, -2)))
+              AND r.origpostdate <= last_day(trunc(add_months(sysdate, -1)))
+              AND r.tranamt > 0
+              AND rt.paidinyn = 'Y'
+            THEN r.tranamt
+          END) AS totdepmonth1,
+          SUM(CASE
+            WHEN r.origpostdate > last_day(trunc(add_months(sysdate, -3)))
+              AND r.origpostdate <= last_day(trunc(add_months(sysdate, -2)))
+              AND r.tranamt > 0
+              AND rt.paidinyn = 'Y'
+            THEN r.tranamt
+          END) AS totdepmonth2,
+          SUM(CASE
+            WHEN r.origpostdate > last_day(trunc(add_months(sysdate, -4)))
+              AND r.origpostdate <= last_day(trunc(add_months(sysdate, -3)))
+              AND r.tranamt > 0
+              AND rt.paidinyn = 'Y'
+            THEN r.tranamt
+          END) AS totdepmonth3
+        FROM accts ac
+        LEFT JOIN rtxn r
+          ON ac.acctnbr = r.acctnbr
+          AND r.origpostdate > last_day(trunc(add_months(sysdate, -4)))
+        LEFT JOIN rtxntyp rt
+          ON r.rtxntypcd = rt.rtxntypcd
+          AND rt.paidinyn = 'Y'
+        GROUP BY ac.acctnbr, ac.orgnbr, ac.newacctyn
+      ),
+      pfi AS (
+        SELECT DISTINCT
+          z.orgnbr,
+          (CASE
+            WHEN z.totdepmonth1 >= 500
+              AND z.totdepmonth2 >= 500
+              AND z.totdepmonth3 >= 500
+            THEN 'Y'
+            WHEN z.newacctyn = 'Y'
+              AND (z.totdepmonth1 >= 500
+                OR z.totdepmonth2 >= 500
+                OR z.totdepmonth3 >= 500)
+            THEN 'Y'
+            ELSE 'N'
+          END) AS pfiyn
+        FROM trans z
+      )
+      SELECT (CASE WHEN z.pfiyn IS NULL THEN 'N' ELSE z.pfiyn END) INTO PFI
+      FROM org o
+      LEFT JOIN pfi z ON o.orgnbr = z.orgnbr
+      WHERE o.purgeyn != 'Y'
+        AND o.orgnbr = IN_ORGNBR
+        AND exists (
+          select 1
+          from acct zz
+          where zz.taxrptfororgnbr = o.orgnbr
+            and zz.curracctstatcd not in ('CLS','CO')
+        )
+        AND rownum = 1;
+      IF PFI IS NULL THEN
+        PFI := 'N';
+      END IF;
+      RETURN PFI;
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+        PFI := 'N';
+        RETURN PFI;
+      WHEN OTHERS THEN
+        PFI := 'N';
+        RETURN PFI;
+    END ORG_PFIYN;
+  END PACKAGE_PFI;
+  /
