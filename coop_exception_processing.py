@@ -1,14 +1,15 @@
-import csv
-import os
-import re
 from dataclasses import dataclass, field
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
-from enum import StrEnum, auto
+from enum import Enum, auto
+from ftfcu_appworx import Apwx, JobTime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from ftfcu_appworx import Apwx, JobTime
+import csv
+import os
+import re
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+
 
 __version__ = "2.00"
 
@@ -75,10 +76,8 @@ POSTED_TOTALS_RE = re.compile(r"^0     POSTED TOTALS")
 NUMERIC_PREFIX_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
 
 
-# ------------------------------------------------------------
-# AppWorx Arguments
-# ------------------------------------------------------------
-class AppWorxEnum(StrEnum):
+class AppWorxEnum(Enum):
+
     COOP_INFILE_PATH = auto()
     COOP_INFILE_NAME = auto()
     OSI_INFILE_PATH = auto()
@@ -91,13 +90,9 @@ class AppWorxEnum(StrEnum):
         return self.name
 
 
-# ------------------------------------------------------------
-# Script Data Container
-# ------------------------------------------------------------
 @dataclass
 class ScriptData:
     apwx: Apwx
-
     coop_file: Path
     osi_file: Path
     matched_file: Path
@@ -119,39 +114,24 @@ class ScriptData:
     exceptions: List[dict] = field(default_factory=list)
 
 
-# ------------------------------------------------------------
-# Main Runner
-# ------------------------------------------------------------
-def run(apwx: Apwx) -> bool:
-    print(f"Job started at {datetime.now()}")
-
-    data = initialize(apwx)
-
-    print("Parsing COOP recon report")
-    parse_coop_file(data)
-
-    print("Parsing OSI recon report")
-    parse_osi_file(data)
-
-    print("Processing transactions")
-    process_coop_data(data)
-
-    print("Preparing output data")
-    prepare_data_for_file(data)
-
-    print("Writing matched file")
-    write_file(data.matched, data.matched_file)
-
-    print("Writing exception file")
-    write_file(data.exceptions, data.exception_file)
-
-    print(f"Job completed at {datetime.now()}")
-    return True
+def get_apwx() -> Apwx:
+    return Apwx(["OSIUPDATE", "OSIUPDATE_PW"])
 
 
-# ------------------------------------------------------------
-# Initialization
-# ------------------------------------------------------------
+def parse_args(apwx: Apwx) -> Apwx:
+    parser = apwx.parser
+    parser.add_arg(str(AppWorxEnum.COOP_INFILE_PATH), type=str, required=False)
+    parser.add_arg(str(AppWorxEnum.COOP_INFILE_NAME), type=str, required=False)
+    parser.add_arg(str(AppWorxEnum.OSI_INFILE_PATH), type=str, required=False)
+    parser.add_arg(str(AppWorxEnum.OSI_INFILE_NAME), type=str, required=False)
+    parser.add_arg(str(AppWorxEnum.OUTFILE_PATH), type=str, required=False)
+    parser.add_arg(str(AppWorxEnum.MATCHED_FILENAME), type=str, required=False)
+    parser.add_arg(str(AppWorxEnum.EXCEPTIONS_FILENAME), type=str, required=False)
+
+    apwx.parse_args()
+    return apwx
+
+
 def initialize(apwx: Apwx) -> ScriptData:
     args = apwx.args
     apply_defaults(args)
@@ -173,14 +153,10 @@ def initialize(apwx: Apwx) -> ScriptData:
     )
 
 
-# ------------------------------------------------------------
-# COOP Fixed-Width Parsing (FULL Perl Parity)
-# ------------------------------------------------------------
 def parse_coop_file(data: ScriptData) -> None:
     with open(data.coop_file, encoding="utf-8") as fh:
         rpt_start = False
         tran_line = 0
-        pan = None
         card = None
         tn = None
 
@@ -198,9 +174,6 @@ def parse_coop_file(data: ScriptData) -> None:
             if HEADER_SKIP_RE.search(line):
                 continue
 
-            # -------------------------
-            # Line 0 (main transaction)
-            # -------------------------
             if tran_line == 0:
                 if not TRAN_LINE_RE.match(line):
                     continue
@@ -211,7 +184,6 @@ def parse_coop_file(data: ScriptData) -> None:
                 c_sign1 = fields["c_sign1"]
                 c_sign2 = fields["c_sign2"]
 
-                # Skip pre-auths
                 if any(fix_data(s) == "*" for s in (sign1, sign2, c_sign1, c_sign2)):
                     data.coop["counters"]["skipped_trans"] += 1
                     continue
@@ -256,9 +228,6 @@ def parse_coop_file(data: ScriptData) -> None:
                 tran_line = 1
                 continue
 
-            # -------------------------
-            # Line 1
-            # -------------------------
             if tran_line == 1 and card is not None and tn is not None:
                 fields = parse_fixed_width(line, LINE1_FIELDS)
                 for name, _width in LINE1_FIELDS:
@@ -266,9 +235,6 @@ def parse_coop_file(data: ScriptData) -> None:
                 tran_line = 2
                 continue
 
-            # -------------------------
-            # Line 2
-            # -------------------------
             if tran_line == 2 and card is not None and tn is not None:
                 fields = parse_fixed_width(line, LINE2_FIELDS)
                 for name, _width in LINE2_FIELDS:
@@ -277,9 +243,6 @@ def parse_coop_file(data: ScriptData) -> None:
                 tran_line = 0
 
 
-# ------------------------------------------------------------
-# OSI (DNA) Parsing
-# ------------------------------------------------------------
 def parse_osi_file(data: ScriptData) -> None:
     with open(data.osi_file, newline="", encoding="utf-8") as fh:
         reader = csv.reader(fh)
@@ -292,10 +255,7 @@ def parse_osi_file(data: ScriptData) -> None:
             for idx, key in enumerate(OSI_COLUMNS):
                 rec[key] = row[idx] if idx < len(row) else ""
 
-            # Limit pan to 16 digits
             rec["pan"] = rec["pan"][:16]
-
-            # Make the data spiffy and clean
             for key in list(rec.keys()):
                 rec[key] = fix_data(rec[key])
 
@@ -317,9 +277,6 @@ def parse_osi_file(data: ScriptData) -> None:
             card["trans"][idx] = rec
 
 
-# ------------------------------------------------------------
-# Matching Logic (Unchanged – already equivalent)
-# ------------------------------------------------------------
 def process_coop_data(data: ScriptData) -> None:
     for card in data.coop["cards"].values():
 
@@ -352,9 +309,6 @@ def process_coop_data(data: ScriptData) -> None:
                         break
 
 
-# ------------------------------------------------------------
-# Reversal Matching
-# ------------------------------------------------------------
 def mark_reversals(trans: Dict[int, dict]) -> None:
     for rt in trans.values():
         if rt["reversal"] != "Y":
@@ -373,9 +327,6 @@ def mark_reversals(trans: Dict[int, dict]) -> None:
                 ot["reversal"] = "Y"
 
 
-# ------------------------------------------------------------
-# Prepare Output
-# ------------------------------------------------------------
 def prepare_data_for_file(data: ScriptData) -> None:
     messages = {
         "C": "Complete match to DNA file",
@@ -402,9 +353,6 @@ def prepare_data_for_file(data: ScriptData) -> None:
                     data.exceptions.append(tran)
 
 
-# ------------------------------------------------------------
-# Write Output Files
-# ------------------------------------------------------------
 def write_file(records: List[dict], filename: Path) -> None:
     field_order = [
         "pan",
@@ -436,9 +384,6 @@ def write_file(records: List[dict], filename: Path) -> None:
             fh.write("|".join(row) + "\n")
 
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
 def dna_trancode_convert(tc: str) -> str:
     return {
         "DWTH": "DEBIT",
@@ -496,7 +441,7 @@ def format_amount(val) -> str:
 
 def apply_defaults(args) -> None:
     for key, default in ARG_DEFAULTS.items():
-        if getattr(args, key, None) is None:
+        if not hasattr(args, key) or getattr(args, key) is None:
             setattr(args, key, default)
 
 
@@ -543,19 +488,31 @@ def validate_appworx_env(apwx: Apwx) -> None:
         raise ValueError(f"Missing AppWorx vars: {', '.join(missing)}")
 
 
-# ------------------------------------------------------------
-# AppWorx Bootstrap
-# ------------------------------------------------------------
-def parse_args(apwx: Apwx) -> Apwx:
-    parser = apwx.parser
-    for arg in AppWorxEnum:
-        parser.add_arg(arg, type=str, required=False)
-    apwx.parse_args()
-    return apwx
+def run(apwx: Apwx) -> bool:
 
+    data = initialize(apwx)
 
-def get_apwx() -> Apwx:
-    return Apwx(["OSIUPDATE", "OSIUPDATE_PW"])
+    print("Parsing COOP recon report")
+    parse_coop_file(data)
+
+    print("Parsing OSI recon report")
+    parse_osi_file(data)
+
+    print("Processing transactions")
+    process_coop_data(data)
+
+    print("Preparing output data")
+    prepare_data_for_file(data)
+
+    print("Writing matched file")
+    write_file(data.matched, data.matched_file)
+
+    print("Writing exception file")
+    write_file(data.exceptions, data.exception_file)
+
+    print("Job complete.")
+
+    return True
 
 
 if __name__ == "__main__":
