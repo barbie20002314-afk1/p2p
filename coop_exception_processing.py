@@ -7,74 +7,10 @@ from typing import Dict, List, Tuple
 import csv
 import os
 import re
-from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 
 __version__ = "2.00"
-
-ARG_DEFAULTS = {
-    "COOP_INFILE_PATH": ".\\Logs",
-    "COOP_INFILE_NAME": "",
-    "OSI_INFILE_PATH": ".\\Logs",
-    "OSI_INFILE_NAME": "",
-    "OUTFILE_PATH": ".\\Logs",
-    "MATCHED_FILENAME": "matched.txt",
-    "EXCEPTIONS_FILENAME": "exceptions.txt",
-}
-
-OSI_COLUMNS = [
-    "pan",
-    "datetime",
-    "trancd",
-    "tranamt",
-    "acctnbr",
-    "local_seq",
-    "transtat",
-    "local_term",
-]
-
-LINE0_FIELDS: List[Tuple[str, int]] = [
-    ("pan", 17),
-    ("trancd", 13),
-    ("junk", 1),
-    ("debit", 11),
-    ("sign1", 1),
-    ("sign2", 1),
-    ("credit", 12),
-    ("c_sign1", 1),
-    ("c_sign2", 1),
-    ("fee", 8),
-    ("sw_date", 5),
-    ("sw_time", 9),
-    ("term_rtnbr", 11),
-    ("sw_term", 8),
-    ("sw_seq", 9),
-]
-
-LINE1_FIELDS: List[Tuple[str, int]] = [
-    ("junk", 7),
-    ("acctnbr", 10),
-    ("junk2", 49),
-    ("loc_date", 5),
-    ("loc_time", 9),
-    ("card_rtnbr", 11),
-    ("local_term", 11),
-    ("local_seq", 16),
-]
-
-LINE2_FIELDS: List[Tuple[str, int]] = [
-    ("junk", 61),
-    ("desc", 70),
-]
-
-TRAN_LINE_RE = re.compile(r"^ \d{16,}")
-HEADER_SKIP_RE = re.compile(
-    r"^1CREDIT UNION|  FIRST TECH FCU|  EFBPD020-RP01|0 CARDHOLDER NUMBER|     PLASTIC NUMBER"
-)
-POSTED_TOTALS_RE = re.compile(r"^0     POSTED TOTALS")
-NUMERIC_PREFIX_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
-
 
 class AppWorxEnum(Enum):
 
@@ -139,10 +75,18 @@ def initialize(apwx: Apwx) -> ScriptData:
     validate_paths(args)
     normalize_paths(args)
 
-    coop_file = Path(f"{args.COOP_INFILE_PATH}{args.COOP_INFILE_NAME}")
-    osi_file = Path(f"{args.OSI_INFILE_PATH}{args.OSI_INFILE_NAME}")
-    matched_file = Path(f"{args.OUTFILE_PATH}{args.MATCHED_FILENAME}")
-    exception_file = Path(f"{args.OUTFILE_PATH}{args.EXCEPTIONS_FILENAME}")
+    coop_path = Path(getattr(args, str(AppWorxEnum.COOP_INFILE_PATH)))
+    coop_name = getattr(args, str(AppWorxEnum.COOP_INFILE_NAME))
+    osi_path = Path(getattr(args, str(AppWorxEnum.OSI_INFILE_PATH)))
+    osi_name = getattr(args, str(AppWorxEnum.OSI_INFILE_NAME))
+    output_path = Path(getattr(args, str(AppWorxEnum.OUTFILE_PATH)))
+    matched_name = getattr(args, str(AppWorxEnum.MATCHED_FILENAME))
+    exception_name = getattr(args, str(AppWorxEnum.EXCEPTIONS_FILENAME))
+
+    coop_file = coop_path / coop_name
+    osi_file = osi_path / osi_name
+    matched_file = output_path / matched_name
+    exception_file = output_path / exception_name
 
     return ScriptData(
         apwx=apwx,
@@ -154,6 +98,46 @@ def initialize(apwx: Apwx) -> ScriptData:
 
 
 def parse_coop_file(data: ScriptData) -> None:
+    line0_fields: List[Tuple[str, int]] = [
+        ("pan", 17),
+        ("trancd", 13),
+        ("junk", 1),
+        ("debit", 11),
+        ("sign1", 1),
+        ("sign2", 1),
+        ("credit", 12),
+        ("c_sign1", 1),
+        ("c_sign2", 1),
+        ("fee", 8),
+        ("sw_date", 5),
+        ("sw_time", 9),
+        ("term_rtnbr", 11),
+        ("sw_term", 8),
+        ("sw_seq", 9),
+    ]
+
+    line1_fields: List[Tuple[str, int]] = [
+        ("junk", 7),
+        ("acctnbr", 10),
+        ("junk2", 49),
+        ("loc_date", 5),
+        ("loc_time", 9),
+        ("card_rtnbr", 11),
+        ("local_term", 11),
+        ("local_seq", 16),
+    ]
+
+    line2_fields: List[Tuple[str, int]] = [
+        ("junk", 61),
+        ("desc", 70),
+    ]
+
+    tran_line_re = re.compile(r"^ \d{16,}")
+    header_skip_re = re.compile(
+        r"^1CREDIT UNION|  FIRST TECH FCU|  EFBPD020-RP01|0 CARDHOLDER NUMBER|     PLASTIC NUMBER"
+    )
+    posted_totals_re = re.compile(r"^0     POSTED TOTALS")
+
     with open(data.coop_file, encoding="utf-8") as fh:
         rpt_start = False
         tran_line = 0
@@ -168,17 +152,17 @@ def parse_coop_file(data: ScriptData) -> None:
                     rpt_start = True
                 continue
 
-            if POSTED_TOTALS_RE.match(line):
+            if posted_totals_re.match(line):
                 break
 
-            if HEADER_SKIP_RE.search(line):
+            if header_skip_re.search(line):
                 continue
 
             if tran_line == 0:
-                if not TRAN_LINE_RE.match(line):
+                if not tran_line_re.match(line):
                     continue
 
-                fields = parse_fixed_width(line, LINE0_FIELDS)
+                fields = parse_fixed_width(line, line0_fields)
                 sign1 = fields["sign1"]
                 sign2 = fields["sign2"]
                 c_sign1 = fields["c_sign1"]
@@ -197,7 +181,7 @@ def parse_coop_file(data: ScriptData) -> None:
                 tn = card["tran_count"] = card["tran_count"] + 1
                 trans = card["trans"].setdefault(tn, {})
 
-                for name, _width in LINE0_FIELDS:
+                for name, _width in line0_fields:
                     trans[name] = fix_data(fields[name])
 
                 if card.get("has_reversal_tran") != "Y":
@@ -229,21 +213,32 @@ def parse_coop_file(data: ScriptData) -> None:
                 continue
 
             if tran_line == 1 and card is not None and tn is not None:
-                fields = parse_fixed_width(line, LINE1_FIELDS)
-                for name, _width in LINE1_FIELDS:
+                fields = parse_fixed_width(line, line1_fields)
+                for name, _width in line1_fields:
                     card["trans"][tn][name] = fix_data(fields[name])
                 tran_line = 2
                 continue
 
             if tran_line == 2 and card is not None and tn is not None:
-                fields = parse_fixed_width(line, LINE2_FIELDS)
-                for name, _width in LINE2_FIELDS:
+                fields = parse_fixed_width(line, line2_fields)
+                for name, _width in line2_fields:
                     card["trans"][tn][name] = fix_data(fields[name])
                 data.coop["counters"]["processed_trans"] += 1
                 tran_line = 0
 
 
 def parse_osi_file(data: ScriptData) -> None:
+    osi_columns = [
+        "pan",
+        "datetime",
+        "trancd",
+        "tranamt",
+        "acctnbr",
+        "local_seq",
+        "transtat",
+        "local_term",
+    ]
+
     with open(data.osi_file, newline="", encoding="utf-8") as fh:
         reader = csv.reader(fh)
 
@@ -252,7 +247,7 @@ def parse_osi_file(data: ScriptData) -> None:
                 continue
 
             rec = {}
-            for idx, key in enumerate(OSI_COLUMNS):
+            for idx, key in enumerate(osi_columns):
                 rec[key] = row[idx] if idx < len(row) else ""
 
             rec["pan"] = rec["pan"][:16]
@@ -419,7 +414,7 @@ def parse_amount(val, remove_commas: bool) -> Decimal:
     s = str(val).strip()
     if remove_commas:
         s = s.replace(",", "")
-    match = NUMERIC_PREFIX_RE.match(s)
+    match = re.match(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)", s)
     if not match:
         return Decimal("0")
     try:
@@ -440,7 +435,17 @@ def format_amount(val) -> str:
 
 
 def apply_defaults(args) -> None:
-    for key, default in ARG_DEFAULTS.items():
+    defaults = {
+        "COOP_INFILE_PATH": ".\\Logs",
+        "COOP_INFILE_NAME": "",
+        "OSI_INFILE_PATH": ".\\Logs",
+        "OSI_INFILE_NAME": "",
+        "OUTFILE_PATH": ".\\Logs",
+        "MATCHED_FILENAME": "matched.txt",
+        "EXCEPTIONS_FILENAME": "exceptions.txt",
+    }
+
+    for key, default in defaults.items():
         if not hasattr(args, key) or getattr(args, key) is None:
             setattr(args, key, default)
 
